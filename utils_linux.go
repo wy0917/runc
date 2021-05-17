@@ -3,13 +3,9 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
-	"net"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strconv"
-
+	"github.com/coreos/go-systemd/v22/activation"
 	"github.com/opencontainers/runc/libcontainer"
 	"github.com/opencontainers/runc/libcontainer/cgroups/systemd"
 	"github.com/opencontainers/runc/libcontainer/configs"
@@ -17,12 +13,19 @@ import (
 	"github.com/opencontainers/runc/libcontainer/utils"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	selinux "github.com/opencontainers/selinux/go-selinux"
-
-	"github.com/coreos/go-systemd/v22/activation"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	"golang.org/x/sys/unix"
+	"io/ioutil"
+	"net"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 )
 
 var errEmptyID = errors.New("container id cannot be empty")
@@ -319,6 +322,35 @@ func (r *runner) run(config *specs.Process) (int, error) {
 	default:
 		panic("Unknown action")
 	}
+
+	if shouldStartTracing(r.container.Config()) {
+		pid, _ := process.Pid()
+		strace_args := []string{
+			"-o", r.container.ID()[:12],
+			"-y", "-yy", "-f", "-ff", "-v", "-s", "1024000", "-e", "trace=file",
+			//"-p", fmt.Sprintf("%d", os.Getpid()),
+			"-p", fmt.Sprintf("%d", pid),
+		}
+
+		trace_log_dir := "/tmp/container-trace/" + r.container.ID()[:12]
+		_ = os.MkdirAll(trace_log_dir, 0755)
+		_ = ioutil.WriteFile(path.Join(trace_log_dir, "init.pid"), []byte(fmt.Sprintf("%d", pid)), 0644)
+		cmd := exec.Command("strace", strace_args...)
+		cmd.Dir = trace_log_dir
+		cmd.Env = os.Environ()
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Setpgid: true,
+			Pgid:    0,
+		}
+		err = cmd.Start()
+		if err != nil {
+			logrus.WithField("runc", 0).Error(fmt.Sprintf("%v", err))
+		}
+		empJSON, _ := json.MarshalIndent(cmd, "", "  ")
+		logrus.WithField("runc", 0).Info(fmt.Sprintf("Tracing cmd: %s\n", empJSON))
+		go cmd.Wait()
+	}
+
 	if err != nil {
 		return -1, err
 	}
@@ -455,4 +487,36 @@ func startContainer(context *cli.Context, spec *specs.Spec, action CtAct, criuOp
 		logLevel:        logLevel,
 	}
 	return r.run(spec.Process)
+}
+
+func shouldStartTracing(config configs.Config) (bool) {
+	var bundleSpec specs.Spec
+	var path string
+	for _, label := range config.Labels {
+		key_val := strings.SplitN(label, "=", 2)
+		if key_val[0] == "bundle"{
+			path = key_val[1]
+		}
+	}
+
+	if len(path) <= 0 {
+		return false
+	}
+
+	bundleConfigContents, err := ioutil.ReadFile(filepath.Join(path, "config.json"))
+	if err != nil {
+		return false
+	}
+	if err := json.Unmarshal(bundleConfigContents, &bundleSpec); err != nil {
+		return false
+	}
+	if bundleSpec.Process != nil {
+		for _, env := range bundleSpec.Process.Env {
+			key_val := strings.SplitN(env, "=", 2)
+			if key_val[0] == "TRACE" && key_val[1] == "true" {
+				return true
+			}
+		}
+	}
+	return false
 }
